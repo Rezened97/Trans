@@ -101,6 +101,7 @@ KEY_WHITELIST = {
     "social_proof", "cta_banner", "footer", "misc", "faq_header"
 }
 
+# Chiavi tecniche da NON tradurre mai
 KEY_BLOCKLIST = {
     "id", "class", "classes", "selector", "type", "tag",
     "href", "src", "url", "slug", "key", "name_attr",
@@ -108,6 +109,7 @@ KEY_BLOCKLIST = {
     "color", "background", "font", "dataset", "data", "value_raw"
 }
 
+# ====== Pattern base ======
 RE_URL = re.compile(r"^(https?:)?//|^[\w\-.]+@\w", re.IGNORECASE)
 RE_COLOR = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 RE_MEASURE = re.compile(r"^\d+(\.\d+)?(px|em|rem|vh|vw|%|cm|mm|in)$", re.IGNORECASE)
@@ -115,6 +117,7 @@ RE_BASE64 = re.compile(r"^data:[\w/+.-]+;base64,", re.IGNORECASE)
 RE_SELECTOR = re.compile(r"^[.#][A-Za-z0-9_\-:.#> \[\]=]+$")
 RE_NUMERICISH = re.compile(r"^[\d\s.,:/+\-%°C°F]+$")
 RE_HTML_TAG = re.compile(r"<[^>]+>")
+RE_SINGLE_TOKEN_ASCII = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]*$")
 
 CODE_KEYWORDS = (
     "function", "var ", "let ", "const ", "return", "=>", "if(", "else",
@@ -162,27 +165,84 @@ def looks_like_code_or_nonhuman(s: str) -> Tuple[bool, str]:
 
     if len(t) <= 2:
         return True, "too_short"
-    if " " not in t and "-" in t and len(t) <= 30:
-        return True, "slug_like"
+
+    # Non marchiamo automaticamente slug qui: lo gestiamo in base alla chiave
     return False, ""
 
+# ====== Regole anti-rottura Elementor ======
+# Valori da NON tradurre per chiavi tecniche/enum
+ENUM_KEYS_EXACT = {
+    "widgetType", "elType", "header_size", "image_size",
+    "display_percentage", "text_stroke_text_stroke_type",
+    "_element_width", "_element_width_mobile",
+}
+
+# Sottostringhe indicative di enum/slug/valori tecnici
+ENUM_KEY_SUBSTR = [
+    "align", "background_", "_background", "overlay",
+    "typography_", "_typography", "font_", "letter_spacing", "line_height",
+    "display_", "border", "radius", "icon_align", "justify",
+    "object_", "position", "repeat", "attachment", "blend",
+    "_element_", "contactform_", "pa_condition_", "__globals__", "__dynamic__",
+    "image_size", "header_size", "style",
+]
+
+def is_enumish_key(key: str) -> bool:
+    k = (key or "")
+    kl = k.lower()
+    if k in ENUM_KEYS_EXACT:
+        return True
+    if any(sub in kl for sub in ENUM_KEY_SUBSTR):
+        return True
+    if kl.startswith("_"):
+        return True
+    return False
+
 def likely_human_text(key: str, value: str) -> Tuple[bool, str]:
+    """
+    True => traducibile; False => lascia invariato.
+    Strategia:
+    - Blocca sempre i valori sotto chiavi tecniche/enum (Elementor).
+    - Traduci se:
+        * key è nella whitelist esplicita, OPPURE
+        * il testo è chiaramente discorsivo (spazi/punteggiatura) e NON enum.
+    - Evita di tradurre parole singole sotto chiavi non-whitelist (spesso enum).
+    """
     k = (key or "").lower()
-    if k in KEY_BLOCKLIST:
+
+    # Chiavi tecniche da NON tradurre mai
+    if k in (kk.lower() for kk in KEY_BLOCKLIST):
         return False, "blocked_key"
-    if k in KEY_WHITELIST:
+
+    # Chiave che sa di enum/slug di Elementor → NON tradurre
+    if is_enumish_key(key):
+        return False, "enum_like_key"
+
+    # Se la chiave è testuale esplicita → usa heuristica generale
+    if k in (kk.lower() for kk in KEY_WHITELIST):
         is_nonhuman, why = looks_like_code_or_nonhuman(value)
         return (not is_nonhuman, f"whitelisted_but_{why}") if is_nonhuman else (True, "")
+
+    # Heuristica sui contenuti
     letters = sum(ch.isalpha() for ch in value)
     spaces = value.count(" ")
-    if spaces == 0 and letters >= 4:
+    has_punct = any(p in value for p in [".", "!", "?", ";", ":", ",", "…", "—"])
+
+    # Parole singole sotto chiavi NON-whitelist → di default NON tradurre (spesso enum)
+    if spaces == 0:
+        if RE_SINGLE_TOKEN_ASCII.match(value.strip()):
+            return False, "single_token_enum"
+        # token non-ASCII (es. con accenti) ma singolo: di solito label brevi → NON tradurre se la chiave non aiuta
         is_nonhuman, why = looks_like_code_or_nonhuman(value)
-        return (not is_nonhuman, f"single_word_{why}") if is_nonhuman else (True, "")
-    if letters >= 2 and (spaces >= 1 or any(p in value for p in [".", "!", "?", ",", "…", "—", ";", ":"])):
+        return (not is_nonhuman, f"single_token_{why}") if is_nonhuman else (False, "single_token_unsure")
+
+    # Frasi con spazi/punteggiatura → probabilmente testo umano
+    if letters >= 2 and (spaces >= 1 or has_punct):
         is_nonhuman, why = looks_like_code_or_nonhuman(value)
         return (not is_nonhuman, f"heuristic_{why}") if is_nonhuman else (True, "")
-    # in dubbio → traduci
-    return True, ""
+
+    # In dubbio e non-whitelist → NON tradurre
+    return False, "no_heuristic_match"
 
 def normalize_api_url(api_key: str) -> str:
     # Auto: Pro (default) o Free se la chiave termina con :fx
@@ -309,7 +369,7 @@ def translate_all_human_text(
             texts = [x["value"] for x in chunk]
             try:
                 trans = deepl_batch_translate(texts, target_lang, api_url, api_key, session=sess, tag_handling=tag)
-            except Exception as e:
+            except Exception:
                 if tag == 'html':
                     try:
                         trans = deepl_batch_translate(texts, target_lang, api_url, api_key, session=sess, tag_handling=None)
@@ -498,3 +558,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

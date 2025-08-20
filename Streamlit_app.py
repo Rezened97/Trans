@@ -89,6 +89,7 @@ def get_api_key_from_settings_or_env() -> str:
 VERBOSE_SKIPS = False
 VERBOSE_BATCH = False
 
+# ——— Whitelist base + estensioni per Elementor Form ———
 KEY_WHITELIST = {
     "title", "subtitle", "heading", "subheading", "headline",
     "text", "label", "caption", "description", "content",
@@ -101,6 +102,19 @@ KEY_WHITELIST = {
     "social_proof", "cta_banner", "footer", "misc", "faq_header"
 }
 
+# Chiavi testuali tipiche dei form Elementor
+FORM_TEXT_KEYS = {
+    "field_label", "placeholder", "help", "description",
+    "step_next_label", "step_previous_label",
+    "button_text",
+    "success_message", "error_message", "server_message",
+    "invalid_message", "required_field_message",
+    "empty_field_message", "email_invalid_message", "upload_invalid_message"
+}
+
+# Estendi whitelist con i form
+KEY_WHITELIST = KEY_WHITELIST.union(FORM_TEXT_KEYS)
+
 # Chiavi tecniche da NON tradurre mai
 KEY_BLOCKLIST = {
     "id", "class", "classes", "selector", "type", "tag",
@@ -108,6 +122,15 @@ KEY_BLOCKLIST = {
     "width", "height", "style", "css", "html", "js", "json",
     "color", "background", "font", "dataset", "data", "value_raw"
 }
+
+# Blocchi tecnici tipici dei form Elementor che non vanno tradotti
+KEY_BLOCKLIST = KEY_BLOCKLIST.union({
+    "form_name", "custom_id", "field_type", "required", "required_message",
+    "options", "value", "values",
+    "webhook", "webhooks", "webhooks_advanced_data", "submit_actions",
+    "email_content", "email_content_2",  # spesso contiene placeholder come "[all-fields]"
+    "acceptance_text",
+})
 
 # ====== Pattern base ======
 RE_URL = re.compile(r"^(https?:)?//|^[\w\-.]+@\w", re.IGNORECASE)
@@ -187,6 +210,11 @@ ENUM_KEY_SUBSTR = [
     "image_size", "header_size", "style",
 ]
 
+# Rafforza con indicatori tipici dei form
+ENUM_KEY_SUBSTR = ENUM_KEY_SUBSTR + [
+    "form_", "field_", "validate", "validation_", "step_", "button_", "message_", "webhook"
+]
+
 def is_enumish_key(key: str) -> bool:
     k = (key or "")
     kl = k.lower()
@@ -232,7 +260,7 @@ def likely_human_text(key: str, value: str) -> Tuple[bool, str]:
     if spaces == 0:
         if RE_SINGLE_TOKEN_ASCII.match(value.strip()):
             return False, "single_token_enum"
-        # token non-ASCII (es. con accenti) ma singolo: di solito label brevi → NON tradurre se la chiave non aiuta
+        # token non-ASCII (es. con accenti) ma singolo
         is_nonhuman, why = looks_like_code_or_nonhuman(value)
         return (not is_nonhuman, f"single_token_{why}") if is_nonhuman else (False, "single_token_unsure")
 
@@ -296,12 +324,31 @@ def deepl_batch_translate(
             time.sleep(1.2 * (attempt + 1))
     return texts
 
+# ——— Supporto specifico: opzioni dei form come lista di dict ———
+def _form_options_label_overrides(node: Any, path: List[Any], acc: List[Dict[str, Any]]) -> bool:
+    """
+    Gestisce il caso comune:
+    options come lista di dict: [{'label': 'Sì', 'value': 'yes'}, ...]
+    → aggiunge solo i 'label' all'accumulatore per la traduzione.
+    Ritorna True se gestito, False altrimenti.
+    """
+    if isinstance(node, list) and all(isinstance(it, dict) for it in node):
+        for i, it in enumerate(node):
+            if "label" in it and isinstance(it["label"], str):
+                acc.append({"path": path + [i, "label"], "key": "label", "value": it["label"]})
+        return True
+    return False
+
 def gather_strings(obj: Any, parent_key: str = "") -> List[Dict[str, Any]]:
     acc: List[Dict[str, Any]] = []
 
     def _walk(node, path, current_key):
         if isinstance(node, dict):
             for k, v in node.items():
+                # Se siamo dentro campi di un form Elementor, intercetta options strutturate
+                if k == "options" and any(p == "form_fields" for p in path):
+                    if _form_options_label_overrides(v, path + [k], acc):
+                        continue
                 _walk(v, path + [k], k)
         elif isinstance(node, list):
             for i, item in enumerate(node):
@@ -558,4 +605,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

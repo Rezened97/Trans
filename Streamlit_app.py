@@ -89,7 +89,7 @@ def get_api_key_from_settings_or_env() -> str:
 VERBOSE_SKIPS = False
 VERBOSE_BATCH = False
 
-# ——— Whitelist base + estensioni per Elementor Form ———
+# ——— Whitelist base ———
 KEY_WHITELIST = {
     "title", "subtitle", "heading", "subheading", "headline",
     "text", "label", "caption", "description", "content",
@@ -102,17 +102,16 @@ KEY_WHITELIST = {
     "social_proof", "cta_banner", "footer", "misc", "faq_header"
 }
 
-# Chiavi testuali tipiche dei form Elementor
+# Chiavi testuali tipiche dei form Elementor (aggiunte alla whitelist)
 FORM_TEXT_KEYS = {
     "field_label", "placeholder", "help", "description",
     "step_next_label", "step_previous_label",
     "button_text",
     "success_message", "error_message", "server_message",
-    "invalid_message", "required_field_message",
-    "empty_field_message", "email_invalid_message", "upload_invalid_message"
+    "invalid_message", "required_field_message", "required_message",
+    "empty_field_message", "email_invalid_message", "upload_invalid_message",
+    "acceptance_text"
 }
-
-# Estendi whitelist con i form
 KEY_WHITELIST = KEY_WHITELIST.union(FORM_TEXT_KEYS)
 
 # Chiavi tecniche da NON tradurre mai
@@ -120,17 +119,13 @@ KEY_BLOCKLIST = {
     "id", "class", "classes", "selector", "type", "tag",
     "href", "src", "url", "slug", "key", "name_attr",
     "width", "height", "style", "css", "html", "js", "json",
-    "color", "background", "font", "dataset", "data", "value_raw"
-}
-
-# Blocchi tecnici tipici dei form Elementor che non vanno tradotti
-KEY_BLOCKLIST = KEY_BLOCKLIST.union({
-    "form_name", "custom_id", "field_type", "required", "required_message",
+    "color", "background", "font", "dataset", "data", "value_raw",
+    # Tecniche dei form (non testuali)
+    "form_name", "custom_id", "field_type", "required",
     "options", "value", "values",
     "webhook", "webhooks", "webhooks_advanced_data", "submit_actions",
-    "email_content", "email_content_2",  # spesso contiene placeholder come "[all-fields]"
-    "acceptance_text",
-})
+    "email_content", "email_content_2"  # spesso contiene placeholder come "[all-fields]"
+}
 
 # ====== Pattern base ======
 RE_URL = re.compile(r"^(https?:)?//|^[\w\-.]+@\w", re.IGNORECASE)
@@ -208,12 +203,10 @@ ENUM_KEY_SUBSTR = [
     "object_", "position", "repeat", "attachment", "blend",
     "_element_", "contactform_", "pa_condition_", "__globals__", "__dynamic__",
     "image_size", "header_size", "style",
+    # indicatori tecnici utili ma non aggressivi
+    "form_", "validate", "validation_", "webhook"
 ]
-
-# Rafforza con indicatori tipici dei form
-ENUM_KEY_SUBSTR = ENUM_KEY_SUBSTR + [
-    "form_", "field_", "validate", "validation_", "step_", "button_", "message_", "webhook"
-]
+# (NOTA: rimosso 'field_', 'step_', 'button_', 'message_' per non bloccare testi dei form)
 
 def is_enumish_key(key: str) -> bool:
     k = (key or "")
@@ -229,47 +222,42 @@ def is_enumish_key(key: str) -> bool:
 def likely_human_text(key: str, value: str) -> Tuple[bool, str]:
     """
     True => traducibile; False => lascia invariato.
-    Strategia:
-    - Blocca sempre i valori sotto chiavi tecniche/enum (Elementor).
-    - Traduci se:
-        * key è nella whitelist esplicita, OPPURE
-        * il testo è chiaramente discorsivo (spazi/punteggiatura) e NON enum.
-    - Evita di tradurre parole singole sotto chiavi non-whitelist (spesso enum).
+    Ordine FIX:
+      1) Blocklist (mai tradurre)
+      2) **Whitelist (sempre tradurre se testo umano)**
+      3) Enumish (in caso di dubbio, NON tradurre)
+      4) Euristica sul contenuto
     """
     k = (key or "").lower()
 
-    # Chiavi tecniche da NON tradurre mai
+    # 1) Mai tradurre
     if k in (kk.lower() for kk in KEY_BLOCKLIST):
         return False, "blocked_key"
 
-    # Chiave che sa di enum/slug di Elementor → NON tradurre
-    if is_enumish_key(key):
-        return False, "enum_like_key"
-
-    # Se la chiave è testuale esplicita → usa heuristica generale
+    # 2) Se è in whitelist → traducibile (salvo sia evidentemente non-umano)
     if k in (kk.lower() for kk in KEY_WHITELIST):
         is_nonhuman, why = looks_like_code_or_nonhuman(value)
         return (not is_nonhuman, f"whitelisted_but_{why}") if is_nonhuman else (True, "")
 
-    # Heuristica sui contenuti
+    # 3) Se sembra enum/tecnico → NON tradurre
+    if is_enumish_key(key):
+        return False, "enum_like_key"
+
+    # 4) Heuristica sui contenuti
     letters = sum(ch.isalpha() for ch in value)
     spaces = value.count(" ")
     has_punct = any(p in value for p in [".", "!", "?", ";", ":", ",", "…", "—"])
 
-    # Parole singole sotto chiavi NON-whitelist → di default NON tradurre (spesso enum)
     if spaces == 0:
         if RE_SINGLE_TOKEN_ASCII.match(value.strip()):
             return False, "single_token_enum"
-        # token non-ASCII (es. con accenti) ma singolo
         is_nonhuman, why = looks_like_code_or_nonhuman(value)
         return (not is_nonhuman, f"single_token_{why}") if is_nonhuman else (False, "single_token_unsure")
 
-    # Frasi con spazi/punteggiatura → probabilmente testo umano
     if letters >= 2 and (spaces >= 1 or has_punct):
         is_nonhuman, why = looks_like_code_or_nonhuman(value)
         return (not is_nonhuman, f"heuristic_{why}") if is_nonhuman else (True, "")
 
-    # In dubbio e non-whitelist → NON tradurre
     return False, "no_heuristic_match"
 
 def normalize_api_url(api_key: str) -> str:
@@ -327,7 +315,6 @@ def deepl_batch_translate(
 # ——— Supporto specifico: opzioni dei form come lista di dict ———
 def _form_options_label_overrides(node: Any, path: List[Any], acc: List[Dict[str, Any]]) -> bool:
     """
-    Gestisce il caso comune:
     options come lista di dict: [{'label': 'Sì', 'value': 'yes'}, ...]
     → aggiunge solo i 'label' all'accumulatore per la traduzione.
     Ritorna True se gestito, False altrimenti.

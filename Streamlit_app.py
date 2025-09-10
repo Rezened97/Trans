@@ -10,6 +10,17 @@ import requests
 import streamlit as st
 
 # =========================
+# Config & costanti globali
+# =========================
+# Limiti "safe" per DeepL
+MAX_BATCH = 45                 # max elementi per richiesta (DeepL consiglia <= 50)
+MAX_CHARS_PER_REQUEST = 80_000 # guardrail sul payload complessivo per call
+
+# Toggle diagnostica
+VERBOSE_SKIPS = False   # mostra cosa viene saltato dall'estrattore
+VERBOSE_BATCH = False   # logga ogni chiamata a DeepL con dimensioni chunk
+
+# =========================
 # Utility: rerun compat
 # =========================
 def _rerun():
@@ -75,7 +86,7 @@ def save_settings(s: Dict[str, Any]) -> Tuple[bool, str]:
         return False, f"Impossibile salvare le impostazioni: {e}"
 
 def get_api_key_from_settings_or_env() -> str:
-    # Nuova priorità suggerita: secrets → settings → env
+    # Priorità: secrets → settings → env (così puoi forzare da Secrets)
     key = st.secrets.get("DEEPL_API_KEY")
     if key:
         return key
@@ -87,10 +98,6 @@ def get_api_key_from_settings_or_env() -> str:
 # =========================
 # Heuristics & translation core
 # =========================
-
-# Toggle diagnostica (disattivata per UI web)
-VERBOSE_SKIPS = False
-VERBOSE_BATCH = False
 
 # ——— Whitelist base ———
 KEY_WHITELIST = {
@@ -191,14 +198,12 @@ def looks_like_code_or_nonhuman(s: str) -> Tuple[bool, str]:
     return False, ""
 
 # ====== Regole anti-rottura Elementor ======
-# Valori da NON tradurre per chiavi tecniche/enum
 ENUM_KEYS_EXACT = {
     "widgetType", "elType", "header_size", "image_size",
     "display_percentage", "text_stroke_text_stroke_type",
     "_element_width", "_element_width_mobile",
 }
 
-# Sottostringhe indicative di enum/slug/valori tecnici
 ENUM_KEY_SUBSTR = [
     "align", "background_", "_background", "overlay",
     "typography_", "_typography", "font_", "letter_spacing", "line_height",
@@ -206,10 +211,8 @@ ENUM_KEY_SUBSTR = [
     "object_", "position", "repeat", "attachment", "blend",
     "_element_", "contactform_", "pa_condition_", "__globals__", "__dynamic__",
     "image_size", "header_size", "style",
-    # indicatori tecnici utili ma non aggressivi
     "form_", "validate", "validation_", "webhook"
 ]
-# (NOTA: rimosso 'field_', 'step_', 'button_', 'message_' per non bloccare testi dei form)
 
 def is_enumish_key(key: str) -> bool:
     k = (key or "")
@@ -227,7 +230,7 @@ def likely_human_text(key: str, value: str) -> Tuple[bool, str]:
     True => traducibile; False => lascia invariato.
     Ordine FIX:
       1) Blocklist (mai tradurre)
-      2) **Whitelist (sempre tradurre se testo umano)**
+      2) Whitelist (sempre tradurre se testo umano)
       3) Enumish (in caso di dubbio, NON tradurre)
       4) Euristica sul contenuto
     """
@@ -296,8 +299,7 @@ def deepl_batch_translate(
             yield cur
 
     out_all: List[str] = []
-    for chunk in chunker(texts, 50 if tag_handling is None else 50, MAX_CHARS_PER_REQUEST):
-        # Nota: usiamo comunque 50 come tetto hard per sicurezza
+    for chunk in chunker(texts, 50, MAX_CHARS_PER_REQUEST):
         data = [
             ('target_lang', target_lang.upper()),
             ('preserve_formatting', '1'),
@@ -306,6 +308,10 @@ def deepl_batch_translate(
             data.append(('tag_handling', tag_handling))
         for t in chunk:
             data.append(('text', t))
+
+        if VERBOSE_BATCH:
+            total_chars = sum(len(t) for t in chunk)
+            st.write(f"Calling DeepL → items={len(chunk)} · tag={tag_handling or 'none'} · chars≈{total_chars}")
 
         # Retry con backoff
         for attempt in range(4):
@@ -323,10 +329,8 @@ def deepl_batch_translate(
 
                 # Se DeepL restituisce meno elementi del richiesto, non annullare il chunk
                 if len(got) < len(chunk):
-                    # Completa con originali dalla coda
                     got += chunk[len(got):]
                 elif len(got) > len(chunk):
-                    # Caso teorico: tronca l’eccesso per mantenere l’allineamento
                     got = got[:len(chunk)]
 
                 # Fix spazi vicino a <b>/<strong>
@@ -368,7 +372,7 @@ def gather_strings(obj: Any, parent_key: str = "") -> List[Dict[str, Any]]:
     def _walk(node, path, current_key):
         if isinstance(node, dict):
             for k, v in node.items():
-                # Se siamo dentro campi di un form Elementor, intercetta options strutturate
+                # Intercetta options strutturate dentro form_fields
                 if k == "options" and any(p == "form_fields" for p in path):
                     if _form_options_label_overrides(v, path + [k], acc):
                         continue
@@ -384,7 +388,7 @@ def gather_strings(obj: Any, parent_key: str = "") -> List[Dict[str, Any]]:
                 if VERBOSE_SKIPS:
                     path_str = "/".join(str(p) for p in path)
                     preview = node[:80].replace("\n", "\\n")
-                    print(f"[SKIP] path='{path_str}' key='{current_key}' value='{preview}{'...' if len(node)>80 else ''}' reason={reason}")
+                    st.write(f"[SKIP] {path_str} | {current_key} | {reason} | {preview}{'...' if len(node)>80 else ''}")
 
     _walk(obj, [], parent_key)
     return acc
@@ -422,8 +426,6 @@ def translate_all_human_text(
 
     # batching
     sess = requests.Session()
-    MAX_BATCH = 45
-    MAX_CHARS_PER_REQUEST = 80_000
 
     total_chunks = (
         ((len(plain) + MAX_BATCH - 1) // MAX_BATCH) +
@@ -469,6 +471,27 @@ def translate_all_human_text(
             set_by_path(obj, ref["path"], new_text)
 
     return obj
+
+# =========================
+# UI helper diagnostici
+# =========================
+def _show_endpoint_banner(api_key: str):
+    api_url = normalize_api_url(api_key)
+    tail = api_key[-6:] if api_key else "??????"
+    st.info(f"Endpoint DeepL in uso: **{api_url}**  ·  key••••{tail}")
+
+def _ping_deepl(api_key: str, target_lang: str = "DE"):
+    try:
+        api_url = normalize_api_url(api_key)
+        r = requests.post(
+            f"{api_url}/v2/translate",
+            headers={"Authorization": f"DeepL-Auth-Key {api_key}"},
+            data=[("target_lang", target_lang), ("text", "PING")]
+        )
+        r.raise_for_status()
+        st.success(f"Ping OK → {r.json()['translations'][0]['text']}")
+    except Exception as e:
+        st.error(f"Ping DeepL FALLITO: {e}")
 
 # =========================
 # Streamlit UI
@@ -527,14 +550,22 @@ def main():
             st.error("Nessuna DeepL API Key trovata. Vai su **Impostazioni** e salvala.")
             st.stop()
 
+        # Banner endpoint + Ping
+        _show_endpoint_banner(api_key)
+        st.button("🔎 Ping DeepL", on_click=lambda: _ping_deepl(api_key), type="secondary")
+
         uploaded = st.file_uploader("Carica il file JSON", type=["json"], accept_multiple_files=False, key="uploader")
         langs = st.text_input("Lingue target (es. EN, FR, HU) — separa con virgole", value="EN")
         langs_list = [x.strip().upper() for x in langs.split(",") if x.strip()]
+
         colA, colB = st.columns([1,1], gap="small")
         with colA:
             start = st.button("Traduci", use_container_width=True)
         with colB:
             clear_btn = st.button("Pulisci risultati", use_container_width=True)
+
+        extract_only = st.toggle("Solo estrazione (no traduzione)", value=False,
+                                 help="Mostra quante e quali stringhe verrebbero tradotte, senza chiamare DeepL.")
 
         if clear_btn:
             st.session_state.translation_results.clear()
@@ -578,6 +609,40 @@ def main():
 
             progress = st.progress(0)
             status = st.empty()
+
+            # ---- DIAGNOSTICA ESTRAZIONE ----
+            refs = gather_strings(data)
+            st.write(f"🔢 Stringhe individuate: **{len(refs)}**")
+
+            html_ok, html_broken_or_minimal, plain = [], [], []
+            for r in refs:
+                v = r["value"]
+                if is_html_like(v):
+                    if html_seems_broken(v):
+                        html_broken_or_minimal.append(r)
+                    else:
+                        html_ok.append(r)
+                else:
+                    plain.append(r)
+            st.write(f"• Plain: **{len(plain)}**  ·  HTML ok: **{len(html_ok)}**  ·  HTML borderline: **{len(html_broken_or_minimal)}**")
+
+            def _preview(items, label):
+                if not items:
+                    st.caption(f"{label}: (vuoto)")
+                    return
+                st.caption(label)
+                for r in items[:10]:
+                    path_str = "/".join(str(p) for p in r["path"])
+                    st.code(f"{path_str} ({r['key']}): {r['value'][:200]}", language="text")
+
+            _preview(plain, "Prime 10 PLAIN")
+            _preview(html_ok, "Prime 10 HTML OK")
+            _preview(html_broken_or_minimal, "Prime 10 HTML borderline")
+
+            if extract_only:
+                st.warning("Modalità 'Solo estrazione' attiva: non verrà chiamata l'API.")
+                st.stop()
+            # ---- FINE DIAGNOSTICA ----
 
             total_langs = len(langs_list)
 
@@ -629,7 +694,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-

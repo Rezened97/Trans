@@ -90,7 +90,7 @@ def get_api_key_from_settings_or_env() -> str:
 
 # Toggle diagnostica (disattivata per UI web)
 VERBOSE_SKIPS = False
-VERBOSE_BATCH = True
+VERBOSE_BATCH = False
 
 # ——— Whitelist base ———
 KEY_WHITELIST = {
@@ -629,6 +629,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

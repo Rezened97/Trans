@@ -75,11 +75,14 @@ def save_settings(s: Dict[str, Any]) -> Tuple[bool, str]:
         return False, f"Impossibile salvare le impostazioni: {e}"
 
 def get_api_key_from_settings_or_env() -> str:
-    # Priorità: settings → secrets → env
+    # Nuova priorità suggerita: secrets → settings → env
+    key = st.secrets.get("DEEPL_API_KEY")
+    if key:
+        return key
     s = load_settings()
     if s.get("DEEPL_API_KEY"):
         return s["DEEPL_API_KEY"]
-    return st.secrets.get("DEEPL_API_KEY", os.environ.get("DEEPL_API_KEY", ""))
+    return os.environ.get("DEEPL_API_KEY", "")
 
 # =========================
 # Heuristics & translation core
@@ -626,5 +629,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 

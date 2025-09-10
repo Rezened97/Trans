@@ -276,41 +276,74 @@ def deepl_batch_translate(
         return []
 
     url = f"{api_url}/v2/translate"
-    data = [
-        ('target_lang', target_lang.upper()),
-        ('preserve_formatting', '1'),
-    ]
-    if tag_handling:
-        data.append(('tag_handling', tag_handling))
-
-    for t in texts:
-        data.append(('text', t))
-
     headers = {'Authorization': f'DeepL-Auth-Key {api_key}'}
     sess = session or requests.Session()
 
-    for attempt in range(4):
-        try:
-            resp = sess.post(url, data=data, headers=headers, timeout=40)
-            if resp.status_code in (401, 403):
-                raise RuntimeError(
-                    "Autorizzazione rifiutata da DeepL (401/403). Controlla la chiave e il piano (Free/Pro)."
-                )
-            if resp.status_code in (429, 500, 502, 503, 504):
-                time.sleep(1.2 * (attempt + 1))
-                continue
+    # Helper: spezza in sottoliste rispettando max pezzi e max caratteri
+    def chunker(seq: List[str], max_items: int, max_chars: int):
+        cur, cur_chars = [], 0
+        for t in seq:
+            tlen = len(t)
+            if cur and (len(cur) >= max_items or (cur_chars + tlen) > max_chars):
+                yield cur
+                cur, cur_chars = [], 0
+            cur.append(t)
+            cur_chars += tlen
+        if cur:
+            yield cur
 
-            resp.raise_for_status()
-            j = resp.json()
-            out = [item['text'] for item in j.get('translations', [])]
-            if len(out) != len(texts):
-                return texts
-            return out
-        except Exception:
-            if attempt == 3:
-                raise
-            time.sleep(1.2 * (attempt + 1))
-    return texts
+    out_all: List[str] = []
+    for chunk in chunker(texts, 50 if tag_handling is None else 50, MAX_CHARS_PER_REQUEST):
+        # Nota: usiamo comunque 50 come tetto hard per sicurezza
+        data = [
+            ('target_lang', target_lang.upper()),
+            ('preserve_formatting', '1'),
+        ]
+        if tag_handling:
+            data.append(('tag_handling', tag_handling))
+        for t in chunk:
+            data.append(('text', t))
+
+        # Retry con backoff
+        for attempt in range(4):
+            try:
+                resp = sess.post(url, data=data, headers=headers, timeout=60)
+                if resp.status_code in (401, 403):
+                    raise RuntimeError("Autorizzazione rifiutata (401/403): controlla chiave/piano (Free vs Pro).")
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(1.2 * (attempt + 1))
+                    continue
+
+                resp.raise_for_status()
+                j = resp.json()
+                got = [item['text'] for item in j.get('translations', [])]
+
+                # Se DeepL restituisce meno elementi del richiesto, non annullare il chunk
+                if len(got) < len(chunk):
+                    # Completa con originali dalla coda
+                    got += chunk[len(got):]
+                elif len(got) > len(chunk):
+                    # Caso teorico: tronca l’eccesso per mantenere l’allineamento
+                    got = got[:len(chunk)]
+
+                # Fix spazi vicino a <b>/<strong>
+                fixed = []
+                for original, t in zip(chunk, got):
+                    if is_html_like(original) or is_html_like(t):
+                        t = fix_bold_spacing(t)
+                    fixed.append(t)
+
+                out_all.extend(fixed)
+                break  # esci dal retry loop su successo
+
+            except Exception:
+                if attempt == 3:
+                    # Fallback: copia gli originali del chunk (meglio di fermarsi)
+                    out_all.extend(chunk)
+                else:
+                    time.sleep(1.2 * (attempt + 1))
+
+    return out_all
 
 # ——— Supporto specifico: opzioni dei form come lista di dict ———
 def _form_options_label_overrides(node: Any, path: List[Any], acc: List[Dict[str, Any]]) -> bool:
@@ -386,7 +419,8 @@ def translate_all_human_text(
 
     # batching
     sess = requests.Session()
-    MAX_BATCH = 120
+    MAX_BATCH = 45
+    MAX_CHARS_PER_REQUEST = 80_000
 
     total_chunks = (
         ((len(plain) + MAX_BATCH - 1) // MAX_BATCH) +
@@ -592,3 +626,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
